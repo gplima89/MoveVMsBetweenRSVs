@@ -1,0 +1,88 @@
+# Connect to Azure
+Connect-AzAccount
+
+# Get all subscriptions
+$subscriptions = Get-AzSubscription
+
+# Prompt user to select a subscription
+Write-Host "Available Subscriptions:"
+$subscriptions | ForEach-Object { Write-Host "$($_.Id) - $($_.Name)" }
+$subscriptionId = Read-Host "Enter the Subscription ID to process"
+Set-AzContext -SubscriptionId $subscriptionId | Out-Null
+
+# Prompt user for inputs
+$resourceGroupName = Read-Host "Enter the Resource Group Name"
+$oldVaultName = Read-Host "Enter the Old Recovery Services Vault Name"
+$newVaultName = Read-Host "Enter the New Recovery Services Vault Name"
+$policyName = Read-Host "Enter the Backup Policy Name for the new Vault"
+
+# Validate Virtual Machines with SQL Tag
+$sqlVms = Get-AzVM -ResourceGroupName $resourceGroupName | Where-Object { $_.Tags['SQL'] -eq 'true' }
+if (-not $sqlVms) {
+    Write-Host "❌ No VMs with tag 'SQL = true' found in resource group: $resourceGroupName"
+    exit
+}
+
+foreach ($vm in $sqlVms) {
+    $vmName = $vm.Name
+    Write-Host "`n🔹 Processing SQL VM: $vmName in Resource Group: $resourceGroupName"
+
+    # Validate Old Vault
+    $oldVault = Get-AzRecoveryServicesVault -Name $oldVaultName -ResourceGroupName $resourceGroupName -ErrorAction SilentlyContinue
+    if (-not $oldVault) { 
+        Write-Host "❌ Old Vault '$oldVaultName' not found. Skipping VM: $vmName"
+        continue
+    }
+    Set-AzRecoveryServicesVaultContext -Vault $oldVault
+
+    # Get SQL Backup Container in Old Vault
+    $oldContainer = Get-AzRecoveryServicesBackupContainer -ContainerType AzureVM -FriendlyName $vmname -vaultId $oldvault.id
+    if (-not $oldContainer) {
+        Write-Host "⚠️ No registered SQL backup container found in old vault for VM: $vmName. Skipping."
+        continue
+    }
+
+    Set-AzRecoveryServicesVaultProperty -Vault $oldvault.ID -SoftDeleteFeatureState Disable
+
+    # Disable SQL Database Backup Protection
+    $backupItems = Get-AzRecoveryServicesBackupItem -Container $oldContainer -WorkloadType AzureVM
+    foreach ($backupItem in $backupItems) {
+        Disable-AzRecoveryServicesBackupProtection -Item $backupItem -RemoveRecoveryPoints -Force
+        Write-Host "✅ Disabled SQL backup protection for VM: $vmName."
+    }
+
+    Start-Sleep -Seconds 60
+
+    # Validate New Vault
+    $newVault = Get-AzRecoveryServicesVault -Name $newVaultName -ResourceGroupName $resourceGroupName -ErrorAction SilentlyContinue
+    if (-not $newVault) { 
+        Write-Host "❌ New Vault '$newVaultName' not found. Skipping VM: $vmName"
+        continue
+    }
+    Set-AzRecoveryServicesVaultContext -Vault $newVault
+
+    # Validate Backup Policy
+    $policy = Get-AzRecoveryServicesBackupProtectionPolicy -VaultId $newVault.Id -Name $policyName -ErrorAction SilentlyContinue
+    if (-not $policy) { 
+        Write-Host "❌ Policy '$policyName' not found in new vault. Skipping VM: $vmName"
+        continue
+    }
+
+    # Register SQL Workload in New Vault with AzureWorkload container type
+    Write-Host "🔍 Registering SQL workload for VM: $vmName in new vault..."
+
+    # Enable SQL Backup Protection in New Vault
+    try {
+        $pol = Get-AzRecoveryServicesBackupProtectionPolicy -Name $policy.Name -VaultId $newVault.ID
+        Enable-AzRecoveryServicesBackupProtection -Policy $pol -Name $vmname -ResourceGroupName $resourcegroupname -VaultId $newVault.ID
+        Write-Host "✅ Successfully enabled SQL database backup in new vault for VM: $vmName."
+    } catch {
+        Write-Host "❌ Failed to enable SQL backup in the new vault for VM: $vmName."
+    }
+
+    Set-AzRecoveryServicesVaultProperty -Vault $oldvault.ID -SoftDeleteFeatureState Enable
+    Set-AzRecoveryServicesVaultProperty -Vault $newvault.ID -SoftDeleteFeatureState Enable
+}
+
+Write-Host "🔹 Process completed successfully."
+ 
